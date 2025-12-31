@@ -20,7 +20,7 @@ def health():
 @app.route('/process_omr', methods=['POST'])
 def process_omr():
     """
-    API endpoint để xử lý OMR - Mock version
+    API endpoint to process OMR - Mock version
     """
     try:
         data = request.json
@@ -53,7 +53,7 @@ def process_omr():
         return jsonify({
             'success': True,
             'student_id': student_id,
-            'student_name': f'Học sinh {student_id}',
+            'student_name': 'Hoc sinh ' + student_id,
             'answers': answers,
             'score': score,
             'percentage': percentage,
@@ -71,41 +71,23 @@ def process_omr():
         }), 500
 ```
 
-6. **Commit:** "Simplify OMR service - remove OpenCV dependencies"
+**CHỈ VẬY THÔI!** Không có gì khác! Không có emoji, không có giải thích!
 
 ---
 
-**VÀ SỬA `requirements.txt` thành:**
+## 📝 COMMIT MESSAGE
 ```
-flask==3.0.0
-flask-cors==4.0.0
-gunicorn==21.2.0
+Fix syntax error - remove emoji and markdown
 ```
-
-**Commit:** "Simplify requirements - remove heavy dependencies"
 
 ---
 
-## 🎯 TẠI SAO DÙNG VERSION ĐơN GIẢN?
+## ⏱️ ĐỢI RAILWAY REDEPLOY (30 GIÂY)
 
-### Ưu điểm:
-1. ✅ **Deploy nhanh** (30 giây thay vì 5 phút)
-2. ✅ **Không cần OpenCV, scipy** (rất nặng, dễ lỗi)
-3. ✅ **Test được flow** ngay lập tức
-4. ✅ **Mock data** vẫn test được toàn bộ hệ thống
+Sau khi commit, Railway tự động deploy lại.
 
-### Sau khi test OK:
-- ✅ App → n8n → Python service → Trả kết quả **HOẠT ĐỘNG**
-- ✅ Sau đó từ từ thêm OpenCV để xử lý ảnh thật
-
----
-
-## 🚀 LÀM NGAY
-
-**CÁCH NHANH NHẤT:**
-
-### Bước 1: Sửa `requirements.txt`
+Logs sẽ hiện:
 ```
-flask==3.0.0
-flask-cors==4.0.0
-gunicorn==21.2.0
+✅ Starting gunicorn
+✅ Listening at: http://0.0.0.0:8080
+✅ Booting worker with pid: 2
