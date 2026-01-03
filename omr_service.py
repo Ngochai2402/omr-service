@@ -23,12 +23,12 @@ WARP_W = 900
 WARP_H = 1300
 
 # Ngưỡng phát hiện ảnh mờ (Laplacian variance)
-BLUR_THRESHOLD = 80.0
+BLUR_THRESHOLD = 50.0  # Giảm từ 80 → 50 (dễ tính hơn)
 
 # Ngưỡng nhận dạng marker (4 chấm đen góc)
-MARKER_MIN_AREA_RATIO = 0.001  # % diện tích ảnh
-MARKER_MAX_AREA_RATIO = 0.06
-MARKER_MIN_CIRCULARITY = 0.55
+MARKER_MIN_AREA_RATIO = 0.0005  # Giảm từ 0.001 → 0.0005 (cho phép marker nhỏ hơn)
+MARKER_MAX_AREA_RATIO = 0.08    # Tăng từ 0.06 → 0.08 (cho phép marker lớn hơn)
+MARKER_MIN_CIRCULARITY = 0.45   # Giảm từ 0.55 → 0.45 (không cần quá tròn)
 
 # Ngưỡng nhận dạng bubble được tô
 FILL_THRESHOLD = 0.22  # Tỉ lệ pixel đen tối thiểu
@@ -98,58 +98,85 @@ def find_corner_markers(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # Adaptive threshold để tìm vùng đen
-    binary = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        51, 7
-    )
+    # Thử nhiều phương pháp threshold
+    methods = [
+        # Method 1: Adaptive threshold (mặc định)
+        lambda: cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            51, 7
+        ),
+        # Method 2: Otsu threshold (backup)
+        lambda: cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
+        # Method 3: Adaptive với block size nhỏ hơn
+        lambda: cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31, 5
+        )
+    ]
     
-    # Tìm contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    all_candidates = []
     
-    h, w = gray.shape[:2]
-    img_area = w * h
+    for method_idx, threshold_method in enumerate(methods):
+        try:
+            binary = threshold_method()
+            
+            # Tìm contours
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            h, w = gray.shape[:2]
+            img_area = w * h
+            
+            # Lọc các contour hình tròn lớn
+            candidates = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                
+                # Filter theo diện tích (tỉ lệ % ảnh)
+                if area < img_area * MARKER_MIN_AREA_RATIO:
+                    continue
+                if area > img_area * MARKER_MAX_AREA_RATIO:
+                    continue
+                
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter <= 0:
+                    continue
+                
+                # Tính độ tròn (circularity)
+                circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                
+                if circularity < MARKER_MIN_CIRCULARITY:
+                    continue
+                
+                # Lấy tâm vòng tròn
+                (x, y), r = cv2.minEnclosingCircle(cnt)
+                
+                if r < 5:  # Giảm từ 8 → 5
+                    continue
+                
+                candidates.append((x, y, area, circularity, method_idx))
+            
+            all_candidates.extend(candidates)
+            
+            # Nếu đã tìm được >= 4 candidates thì dừng
+            if len(candidates) >= 4:
+                break
+                
+        except Exception:
+            continue
     
-    # Lọc các contour hình tròn lớn
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        
-        # Filter theo diện tích (tỉ lệ % ảnh)
-        if area < img_area * MARKER_MIN_AREA_RATIO:
-            continue
-        if area > img_area * MARKER_MAX_AREA_RATIO:
-            continue
-        
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter <= 0:
-            continue
-        
-        # Tính độ tròn (circularity)
-        circularity = 4 * np.pi * (area / (perimeter * perimeter))
-        
-        if circularity < MARKER_MIN_CIRCULARITY:
-            continue
-        
-        # Lấy tâm vòng tròn
-        (x, y), r = cv2.minEnclosingCircle(cnt)
-        
-        if r < 8:  # Quá nhỏ
-            continue
-        
-        candidates.append((x, y, area, circularity))
-    
-    if len(candidates) < 4:
+    if len(all_candidates) < 4:
         return None, {
             "markers_found": False,
-            "marker_candidates": len(candidates)
+            "marker_candidates": len(all_candidates)
         }
     
     # Sắp xếp theo diện tích, lấy top 14
-    candidates.sort(key=lambda t: t[2], reverse=True)
-    top_candidates = candidates[:min(14, len(candidates))]
+    all_candidates.sort(key=lambda t: t[2], reverse=True)
+    top_candidates = all_candidates[:min(14, len(all_candidates))]
     
     # Tìm 4 góc từ candidates
     pts = np.array([[t[0], t[1]] for t in top_candidates], dtype=np.float32)
@@ -167,7 +194,7 @@ def find_corner_markers(image):
     
     return corners, {
         "markers_found": True,
-        "marker_candidates": len(candidates)
+        "marker_candidates": len(all_candidates)
     }
 
 
