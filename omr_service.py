@@ -31,17 +31,17 @@ MARKER_MAX_AREA_RATIO = 0.08    # Tăng từ 0.06 → 0.08 (cho phép marker l�
 MARKER_MIN_CIRCULARITY = 0.45   # Giảm từ 0.55 → 0.45 (không cần quá tròn)
 
 # Ngưỡng nhận dạng bubble được tô
-FILL_THRESHOLD = 0.22  # Tỉ lệ pixel đen tối thiểu
-MIN_GAP = 0.06  # Khoảng cách tối thiểu giữa bubble chắc nhất và bubble thứ 2
+FILL_THRESHOLD = 0.12  # Giảm xuống 0.12 (12% pixel đen)
+MIN_GAP = 0.03  # Giảm xuống 0.03 (3% gap)
 
 # ROI (x1_norm, y1_norm, x2_norm, y2_norm) - normalized coordinates
 # Mã học sinh: 3 cột số 0-9
-STUDENT_ID_ROI = (0.22, 0.17, 0.78, 0.49)
+STUDENT_ID_ROI = (0.15, 0.22, 0.85, 0.49)  # Cập nhật theo template thực tế
 STUDENT_COLS = 3
 STUDENT_ROWS = 10
 
-# Đáp án: Grid N câu x 4 cột ABCD
-ANSWERS_ROI = (0.08, 0.57, 0.92, 0.93)
+# Đáp án: Grid N câu x 4 cột ABCD  
+ANSWERS_ROI = (0.08, 0.57, 0.92, 0.93)  # Giữ nguyên
 CHOICES = ["A", "B", "C", "D"]
 
 
@@ -516,6 +516,29 @@ def process_omr():
         # BƯỚC 4: Warp perspective
         warped = warp_perspective(image, corners)
         
+        # Lưu ảnh debug nếu bật debug mode
+        debug_images = {}
+        if debug_mode:
+            try:
+                # Lưu ảnh warped dưới dạng base64 để trả về
+                _, warped_buffer = cv2.imencode('.jpg', warped)
+                warped_base64 = base64.b64encode(warped_buffer).decode('utf-8')
+                debug_images['warped'] = f"data:image/jpeg;base64,{warped_base64}"
+                
+                # Lưu vùng ROI mã học sinh
+                student_roi_img, _ = get_roi(warped, STUDENT_ID_ROI)
+                _, student_roi_buffer = cv2.imencode('.jpg', student_roi_img)
+                student_roi_base64 = base64.b64encode(student_roi_buffer).decode('utf-8')
+                debug_images['student_id_roi'] = f"data:image/jpeg;base64,{student_roi_base64}"
+                
+                # Lưu vùng ROI đáp án
+                answer_roi_img, _ = get_roi(warped, ANSWERS_ROI)
+                _, answer_roi_buffer = cv2.imencode('.jpg', answer_roi_img)
+                answer_roi_base64 = base64.b64encode(answer_roi_buffer).decode('utf-8')
+                debug_images['answers_roi'] = f"data:image/jpeg;base64,{answer_roi_base64}"
+            except Exception:
+                pass
+        
         warp_info = {
             **marker_info,
             "warp_size": f"{WARP_W}x{WARP_H}",
@@ -525,13 +548,10 @@ def process_omr():
         # BƯỚC 5: Đọc mã học sinh
         student_id, id_debug = read_student_id(warped)
         
+        # Nếu không đọc được mã HS → dùng mã mặc định, KHÔNG FAIL
         if student_id is None:
-            debug_payload = {
-                "blur_variance": round(blur_var, 2),
-                **warp_info,
-                **id_debug
-            } if debug_mode else None
-            return error_response(422, "Cannot read student ID clearly. Please check the bubbles are filled properly.", debug_payload)
+            student_id = "0"  # Mã mặc định
+            id_debug["warning"] = "Student ID not detected, using default '0'"
         
         # BƯỚC 6: Đọc đáp án
         answers, ans_debug = read_answers(warped, total_questions)
@@ -557,7 +577,8 @@ def process_omr():
                 **warp_info,
                 **id_debug,
                 **ans_debug,
-                **stats
+                **stats,
+                "images": debug_images
             }
         
         return jsonify(response), 200
