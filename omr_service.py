@@ -35,13 +35,13 @@ FILL_THRESHOLD = 0.12  # Giảm xuống 0.12 (12% pixel đen)
 MIN_GAP = 0.03  # Giảm xuống 0.03 (3% gap)
 
 # ROI (x1_norm, y1_norm, x2_norm, y2_norm) - normalized coordinates
-# Mã học sinh: 3 cột số 0-9
-STUDENT_ID_ROI = (0.15, 0.22, 0.85, 0.49)  # Cập nhật theo template thực tế
+# Mã học sinh: 3 cột số 0-9 (bắt đầu từ y=0.18, kết thúc y=0.52)
+STUDENT_ID_ROI = (0.20, 0.18, 0.80, 0.52)  # Điều chỉnh theo ảnh thật
 STUDENT_COLS = 3
 STUDENT_ROWS = 10
 
-# Đáp án: Grid N câu x 4 cột ABCD  
-ANSWERS_ROI = (0.08, 0.57, 0.92, 0.93)  # Giữ nguyên
+# Đáp án: Grid N câu x 4 cột ABCD (bắt đầu từ y=0.54, kết thúc y=0.94)
+ANSWERS_ROI = (0.06, 0.54, 0.94, 0.94)  # Mở rộng 1 chút
 CHOICES = ["A", "B", "C", "D"]
 
 
@@ -347,14 +347,26 @@ def read_student_id(warped_image):
     binary = prep_binary(gray)
     
     h, w = binary.shape[:2]
-    col_width = w / STUDENT_COLS
+    
+    # Tính vị trí chính xác của 3 cột
+    # Giả sử 3 cột cách đều nhau, mỗi cột chiếm ~1/3 width
+    col_centers = [
+        int(w * 0.25),   # Cột #1 ở 25% width
+        int(w * 0.50),   # Cột #2 ở 50% width  
+        int(w * 0.75)    # Cột #3 ở 75% width
+    ]
+    
+    col_width_half = int(w * 0.12)  # Mỗi cột rộng ~24% width (±12%)
     
     digits = []
     digit_scores = []
     
-    for col_idx in range(STUDENT_COLS):
-        x1 = int(col_idx * col_width)
-        x2 = int((col_idx + 1) * col_width)
+    for col_idx, col_center in enumerate(col_centers):
+        x1 = col_center - col_width_half
+        x2 = col_center + col_width_half
+        x1 = max(0, x1)
+        x2 = min(w, x2)
+        
         col_img = binary[:, x1:x2]
         
         # Đọc 10 hàng (0-9) trong 1 cột
