@@ -1,448 +1,475 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import base64
+#!/usr/bin/env python3
+"""
+omr_service.py - Real OMR Service with OpenCV
+Không demo, không random, chỉ xử lý ảnh thật
+"""
+
+import os
 import cv2
 import numpy as np
+import base64
+from io import BytesIO
+from PIL import Image
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# ======================================================
-# 1) CONFIG CHUNG (MẪU CỐ ĐỊNH + CHỐNG LỆCH ẢNH CHỤP)
-# ======================================================
-WARP_W = 900
-WARP_H = 1300
+# ========================
+# CẤU HÌNH THUẬT TOÁN
+# ========================
 
-# Ngưỡng mực tô (tỉ lệ pixel mực trong vòng tròn)
-FILL_THRESHOLD = 0.22
+# Kích thước ảnh sau warp
+WARPED_WIDTH = 900
+WARPED_HEIGHT = 1300
 
-# Nếu top1-top2 sát nhau -> coi là không chắc (tô mờ / tô 2 ô)
-MIN_GAP = 0.06
+# Ngưỡng phát hiện ảnh mờ (Laplacian variance)
+BLUR_THRESHOLD = 100.0
 
-# Check ảnh mờ: variance of Laplacian
-BLUR_MIN_VAR = 80.0
+# Ngưỡng nhận dạng marker (4 chấm đen góc)
+MARKER_MIN_AREA = 800
+MARKER_MAX_AREA = 25000
+MARKER_MIN_CIRCULARITY = 0.55
 
-# Bật debug (trả thêm scores)
-DEFAULT_DEBUG = False
+# Ngưỡng nhận dạng bubble được tô
+FILL_THRESHOLD = 0.22  # Tỉ lệ pixel đen tối thiểu
+MIN_GAP = 0.06  # Khoảng cách tối thiểu giữa bubble chắc nhất và bubble thứ 2
 
+# ROI (tỉ lệ % trên ảnh đã warp)
+# Mã học sinh: [y_start%, y_end%, x_start%, x_end%]
+STUDENT_ID_ROI = [0.15, 0.40, 0.15, 0.85]  # 3 cột số 0-9
 
-# ======================================================
-# 2) ROI (tỉ lệ trên ảnh đã warp 900x1300)
-#    Thầy có thể chỉnh nhẹ nếu cần, nhưng thường dùng được.
-# ======================================================
-# Vùng khung "MÃ HỌC SINH"
-STUDENT_ROI = (0.22, 0.17, 0.78, 0.49)
-STUDENT_COLS = 3
-STUDENT_ROWS = 10  # 0..9
-
-# Vùng khung "CÂU TRẢ LỜI"
-ANS_ROI = (0.08, 0.57, 0.92, 0.93)
-CHOICES = ["A", "B", "C", "D"]
+# Đáp án: [y_start%, y_end%, x_start%, x_end%]
+ANSWERS_ROI = [0.45, 0.95, 0.08, 0.92]  # Grid N câu x 4 cột ABCD
 
 
-# ======================================================
-# 3) ROUTES
-# ======================================================
-@app.route("/health", methods=["GET"])
-def health():
+# ========================
+# HÀM TIỆN ÍCH
+# ========================
+
+def decode_base64_image(base64_string):
+    """Chuyển base64 -> OpenCV BGR image"""
+    if ',' in base64_string:
+        base64_string = base64_string.split(',')[1]
+    
+    img_data = base64.b64decode(base64_string)
+    img = Image.open(BytesIO(img_data))
+    img_np = np.array(img)
+    
+    # RGB -> BGR cho OpenCV
+    if len(img_np.shape) == 3:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+    
+    return img_bgr
+
+
+def check_image_blur(image):
+    """Kiểm tra ảnh mờ bằng Laplacian variance"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return laplacian_var
+
+
+def find_markers(image):
+    """Tìm 4 chấm đen tròn ở 4 góc làm marker"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold để tìm vùng đen
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Tìm contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Lọc các contour hình tròn
+    markers = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        
+        if area < MARKER_MIN_AREA or area > MARKER_MAX_AREA:
+            continue
+        
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+        
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        
+        if circularity >= MARKER_MIN_CIRCULARITY:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                markers.append((cx, cy, area, circularity))
+    
+    if len(markers) < 4:
+        return None
+    
+    # Sắp xếp 4 góc: top-left, top-right, bottom-right, bottom-left
+    markers_sorted = sorted(markers, key=lambda m: m[1])  # Sắp theo y
+    
+    top_two = sorted(markers_sorted[:2], key=lambda m: m[0])  # 2 điểm trên sắp theo x
+    bottom_two = sorted(markers_sorted[2:4], key=lambda m: m[0])  # 2 điểm dưới sắp theo x
+    
+    corners = np.array([
+        [top_two[0][0], top_two[0][1]],      # top-left
+        [top_two[1][0], top_two[1][1]],      # top-right
+        [bottom_two[1][0], bottom_two[1][1]],  # bottom-right
+        [bottom_two[0][0], bottom_two[0][1]]   # bottom-left
+    ], dtype=np.float32)
+    
+    return corners
+
+
+def warp_perspective(image, corners):
+    """Warp ảnh về góc nhìn chuẩn"""
+    dst_corners = np.array([
+        [0, 0],
+        [WARPED_WIDTH, 0],
+        [WARPED_WIDTH, WARPED_HEIGHT],
+        [0, WARPED_HEIGHT]
+    ], dtype=np.float32)
+    
+    M = cv2.getPerspectiveTransform(corners, dst_corners)
+    warped = cv2.warpPerspective(image, M, (WARPED_WIDTH, WARPED_HEIGHT))
+    
+    return warped
+
+
+def get_roi(image, roi_percent):
+    """Lấy vùng ROI theo tỉ lệ %"""
+    h, w = image.shape[:2]
+    y1 = int(h * roi_percent[0])
+    y2 = int(h * roi_percent[1])
+    x1 = int(w * roi_percent[2])
+    x2 = int(w * roi_percent[3])
+    return image[y1:y2, x1:x2]
+
+
+def get_bubble_score(cell_img):
+    """Tính tỉ lệ pixel đen trong bubble (sau threshold)"""
+    gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+    
+    total_pixels = binary.size
+    filled_pixels = np.sum(binary > 0)
+    score = filled_pixels / total_pixels if total_pixels > 0 else 0
+    
+    return score
+
+
+def select_bubble(scores):
+    """
+    Chọn bubble từ list scores
+    Trả về: (index, confident)
+    - index: vị trí bubble (0-3 cho ABCD, 0-9 cho số)
+    - confident: True nếu chắc chắn, False nếu không chắc
+    """
+    if not scores or len(scores) == 0:
+        return None, False
+    
+    # Sắp xếp scores giảm dần
+    sorted_scores = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    
+    best_idx, best_score = sorted_scores[0]
+    
+    # Kiểm tra có đạt ngưỡng tô không
+    if best_score < FILL_THRESHOLD:
+        return None, False
+    
+    # Kiểm tra khoảng cách với bubble thứ 2
+    if len(sorted_scores) > 1:
+        second_score = sorted_scores[1][1]
+        gap = best_score - second_score
+        
+        if gap < MIN_GAP:
+            return best_idx, False  # Không chắc chắn
+    
+    return best_idx, True
+
+
+def extract_student_id(warped_image):
+    """
+    Đọc mã học sinh (3 cột, mỗi cột 10 số từ 0-9)
+    Trả về: (student_id_string, confident, debug_info)
+    """
+    roi = get_roi(warped_image, STUDENT_ID_ROI)
+    h, w = roi.shape[:2]
+    
+    col_width = w // 3
+    row_height = h // 10
+    
+    student_id = ""
+    debug_cols = []
+    all_confident = True
+    
+    for col_idx in range(3):
+        x1 = col_idx * col_width
+        x2 = (col_idx + 1) * col_width
+        
+        scores = []
+        for digit in range(10):
+            y1 = digit * row_height
+            y2 = (digit + 1) * row_height
+            
+            cell = roi[y1:y2, x1:x2]
+            score = get_bubble_score(cell)
+            scores.append(score)
+        
+        selected_digit, confident = select_bubble(scores)
+        
+        debug_cols.append({
+            "col": col_idx,
+            "scores": [round(s, 3) for s in scores],
+            "selected": selected_digit,
+            "confident": confident
+        })
+        
+        if selected_digit is None or not confident:
+            all_confident = False
+            return None, False, debug_cols
+        
+        student_id += str(selected_digit)
+    
+    return student_id, all_confident, debug_cols
+
+
+def extract_answers(warped_image, num_questions):
+    """
+    Đọc đáp án (N câu, mỗi câu 4 bubble ABCD)
+    Trả về: (answers_list, debug_info)
+    """
+    roi = get_roi(warped_image, ANSWERS_ROI)
+    h, w = roi.shape[:2]
+    
+    # Tính số câu trên mỗi cột (layout 2 cột)
+    questions_per_col = (num_questions + 1) // 2
+    row_height = h // questions_per_col
+    
+    answers = []
+    debug_questions = []
+    
+    for q_idx in range(num_questions):
+        # Xác định cột và hàng
+        if q_idx < questions_per_col:
+            # Cột 1 (trái)
+            x1 = 0
+            x2 = w // 2
+            row_in_col = q_idx
+        else:
+            # Cột 2 (phải)
+            x1 = w // 2
+            x2 = w
+            row_in_col = q_idx - questions_per_col
+        
+        y1 = row_in_col * row_height
+        y2 = (row_in_col + 1) * row_height
+        
+        question_row = roi[y1:y2, x1:x2]
+        
+        # Chia thành 4 bubble A B C D
+        qh, qw = question_row.shape[:2]
+        bubble_width = qw // 4
+        
+        scores = []
+        for opt_idx in range(4):
+            bx1 = opt_idx * bubble_width
+            bx2 = (opt_idx + 1) * bubble_width
+            
+            bubble_cell = question_row[:, bx1:bx2]
+            score = get_bubble_score(bubble_cell)
+            scores.append(score)
+        
+        selected_idx, confident = select_bubble(scores)
+        
+        if selected_idx is not None and confident:
+            answer = chr(ord('A') + selected_idx)
+        else:
+            answer = None
+        
+        answers.append(answer)
+        
+        debug_questions.append({
+            "question": q_idx + 1,
+            "scores": [round(s, 3) for s in scores],
+            "selected": answer,
+            "confident": confident
+        })
+    
+    return answers, debug_questions
+
+
+def grade_answers(student_answers, answer_key, pass_threshold):
+    """Chấm điểm"""
+    total = len(answer_key)
+    correct = 0
+    
+    for student_ans, correct_ans in zip(student_answers, answer_key):
+        if student_ans == correct_ans:
+            correct += 1
+    
+    percentage = round((correct / total * 100)) if total > 0 else 0
+    status = "PASS" if percentage >= pass_threshold else "FAIL"
+    
+    return correct, percentage, status
+
+
+# ========================
+# API ENDPOINTS
+# ========================
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
     return jsonify({
-        "status": "OK",
-        "message": "QuickGrader OMR Service running",
-        "version": "2.1.0-fixed-template-robust"
-    })
+        "status": "ok",
+        "service": "Real OMR",
+        "version": "2.0"
+    }), 200
 
 
-@app.route("/process_omr", methods=["POST"])
+@app.route('/process_omr', methods=['POST'])
 def process_omr():
+    """Main OMR processing endpoint"""
     try:
-        data = request.json or {}
-
-        answer_key = data.get("answer_key") or []
-        pass_threshold = int(data.get("pass_threshold", 80) or 80)
-
-        # n8n/app có thể gửi "image" hoặc "image_base64"
-        image_data = data.get("image") or data.get("image_base64")
-        debug = bool(data.get("debug", DEFAULT_DEBUG))
-
-        if not image_data:
-            return _err(400, "Missing image (image/image_base64)")
-
-        if not answer_key:
-            return _err(400, "answer_key is empty")
-
-        img = _decode_base64_image(image_data)
-
-        # 1) Check blur
-        blur_var = _blur_var(img)
-        if blur_var < BLUR_MIN_VAR:
-            return _err(422, "Image is blurry. Please retake.", debug_payload={
-                "blur_var": blur_var,
-                "blur_min_var": BLUR_MIN_VAR
-            })
-
-        # 2) Warp theo 4 marker
-        warped, warp_info = _warp_to_template(img)
-        if warped is None:
-            return _err(422, "Cannot find 4 corner markers. Please retake.", debug_payload={
-                **warp_info,
-                "blur_var": blur_var
-            })
-
-        total_questions = len(answer_key)
-
-        # 3) Read student id
-        student_id, stu_dbg = _read_student_id(warped)
-        if not student_id:
-            return _err(422, "Student ID not detected (unclear bubbles). Please retake.", debug_payload={
-                "blur_var": blur_var,
-                **warp_info,
-                **stu_dbg
-            })
-
-        # 4) Read answers
-        answers, ans_dbg = _read_answers(warped, total_questions)
-
-        # 5) Grade
-        score, percentage, status, stats = _grade(answers, answer_key, pass_threshold)
-
-        resp = {
+        data = request.json
+        
+        # Validate input
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "No JSON data provided"
+            }), 400
+        
+        # Lấy tham số
+        image_base64 = data.get('image') or data.get('image_base64')
+        answer_key = data.get('answer_key', [])
+        pass_threshold = data.get('pass_threshold', 50)
+        debug_mode = data.get('debug', False)
+        
+        if not image_base64:
+            return jsonify({
+                "success": False,
+                "error": "Missing 'image' or 'image_base64' field"
+            }), 400
+        
+        if not answer_key or len(answer_key) == 0:
+            return jsonify({
+                "success": False,
+                "error": "Missing or empty 'answer_key'"
+            }), 400
+        
+        num_questions = len(answer_key)
+        
+        # BƯỚC 1: Decode ảnh
+        try:
+            image = decode_base64_image(image_base64)
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": f"Failed to decode image: {str(e)}"
+            }), 400
+        
+        # BƯỚC 2: Kiểm tra ảnh mờ
+        blur_var = check_image_blur(image)
+        
+        if blur_var < BLUR_THRESHOLD:
+            response = {
+                "success": False,
+                "error": "Image is blurry. Please retake."
+            }
+            if debug_mode:
+                response["debug"] = {
+                    "blur_variance": round(blur_var, 2),
+                    "threshold": BLUR_THRESHOLD
+                }
+            return jsonify(response), 422
+        
+        # BƯỚC 3: Tìm 4 marker
+        markers = find_markers(image)
+        
+        if markers is None:
+            response = {
+                "success": False,
+                "error": "Cannot find 4 corner markers. Please ensure all 4 black circles are visible."
+            }
+            if debug_mode:
+                response["debug"] = {
+                    "markers_found": "less than 4",
+                    "blur_variance": round(blur_var, 2)
+                }
+            return jsonify(response), 422
+        
+        # BƯỚC 4: Warp perspective
+        warped = warp_perspective(image, markers)
+        
+        # BƯỚC 5: Đọc mã học sinh
+        student_id, id_confident, id_debug = extract_student_id(warped)
+        
+        if not id_confident or student_id is None:
+            response = {
+                "success": False,
+                "error": "Cannot read student ID clearly. Please check the bubbles are filled properly."
+            }
+            if debug_mode:
+                response["debug"] = {
+                    "blur_variance": round(blur_var, 2),
+                    "markers_found": 4,
+                    "markers": markers.tolist(),
+                    "student_id_debug": id_debug
+                }
+            return jsonify(response), 422
+        
+        # BƯỚC 6: Đọc đáp án
+        answers, answers_debug = extract_answers(warped, num_questions)
+        
+        # BƯỚC 7: Chấm điểm
+        score, percentage, status = grade_answers(answers, answer_key, pass_threshold)
+        
+        # Lấy tên học sinh (giả định có bảng tra hoặc trả về mặc định)
+        student_name = f"Hoc sinh {student_id}"
+        
+        # Response thành công
+        response = {
             "success": True,
-            "student_id": str(student_id),
-            "student_name": f"Hoc sinh {student_id}",
-            "answers": [a if a is not None else "" for a in answers],
+            "student_id": student_id,
+            "student_name": student_name,
+            "answers": answers,
             "score": score,
             "percentage": percentage,
-            "status": status,
+            "status": status
         }
-
-        if debug:
-            resp["debug"] = {
-                "blur_var": blur_var,
-                **warp_info,
-                **stu_dbg,
-                **ans_dbg,
-                **stats
+        
+        # Thêm debug info nếu cần
+        if debug_mode:
+            response["debug"] = {
+                "blur_variance": round(blur_var, 2),
+                "markers_found": 4,
+                "markers": markers.tolist(),
+                "student_id_debug": id_debug,
+                "answers_debug": answers_debug,
+                "warped_size": [WARPED_WIDTH, WARPED_HEIGHT],
+                "roi_student_id": STUDENT_ID_ROI,
+                "roi_answers": ANSWERS_ROI
             }
-
-        return jsonify(resp)
-
+        
+        return jsonify(response), 200
+        
     except Exception as e:
-        return _err(500, str(e))
-
-
-# ======================================================
-# 4) CORE FUNCTIONS
-# ======================================================
-def _err(code: int, msg: str, debug_payload=None):
-    payload = {"success": False, "error": msg}
-    if debug_payload:
-        payload["debug"] = debug_payload
-    return jsonify(payload), code
-
-
-def _decode_base64_image(data_url: str):
-    if "," in data_url:
-        b64 = data_url.split(",", 1)[1]
-    else:
-        b64 = data_url
-
-    img_bytes = base64.b64decode(b64)
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Cannot decode image")
-    return img
-
-
-def _blur_var(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def _order_points(pts):
-    pts = np.array(pts, dtype="float32")
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).reshape(-1)
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return np.array([tl, tr, br, bl], dtype="float32")
-
-
-def _find_corner_markers(img_bgr):
-    """
-    Tìm 4 chấm đen tròn ở 4 góc.
-    Trả về 4 điểm (tl,tr,br,bl) hoặc None.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    thr = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        51, 7
-    )
-
-    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    h, w = gray.shape[:2]
-    img_area = w * h
-
-    candidates = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < img_area * 0.001:
-            continue
-        if area > img_area * 0.06:
-            continue
-
-        peri = cv2.arcLength(c, True)
-        if peri <= 0:
-            continue
-
-        circularity = 4 * np.pi * (area / (peri * peri))
-        if circularity < 0.55:
-            continue
-
-        (x, y), r = cv2.minEnclosingCircle(c)
-        if r < 8:
-            continue
-
-        candidates.append((x, y, area, circularity))
-
-    if len(candidates) < 4:
-        return None, {"markers_found": False, "marker_candidates": len(candidates)}
-
-    # chọn top theo area
-    candidates.sort(key=lambda t: t[2], reverse=True)
-    top = candidates[:14]
-    pts = np.array([[t[0], t[1]] for t in top], dtype=np.float32)
-
-    tl = pts[np.argmin(pts[:, 0] + pts[:, 1])]
-    tr = pts[np.argmin(-pts[:, 0] + pts[:, 1])]
-    br = pts[np.argmax(pts[:, 0] + pts[:, 1])]
-    bl = pts[np.argmin(pts[:, 0] - pts[:, 1])]
-
-    ordered = _order_points([tl, tr, br, bl])
-    return ordered, {"markers_found": True, "marker_candidates": len(candidates)}
-
-
-def _warp_to_template(img_bgr):
-    corners, info = _find_corner_markers(img_bgr)
-    if corners is None:
-        return None, info
-
-    dst = np.array([
-        [0, 0],
-        [WARP_W - 1, 0],
-        [WARP_W - 1, WARP_H - 1],
-        [0, WARP_H - 1],
-    ], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(corners, dst)
-    warped = cv2.warpPerspective(img_bgr, M, (WARP_W, WARP_H))
-
-    info2 = {
-        **info,
-        "warp_size": f"{WARP_W}x{WARP_H}",
-        "corners": corners.tolist(),
-    }
-    return warped, info2
-
-
-def _roi(img_bgr, roi_norm):
-    x1n, y1n, x2n, y2n = roi_norm
-    h, w = img_bgr.shape[:2]
-    x1 = int(x1n * w); y1 = int(y1n * h)
-    x2 = int(x2n * w); y2 = int(y2n * h)
-    x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w, x2))
-    y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h, y2))
-    return img_bgr[y1:y2, x1:x2], (x1, y1, x2, y2)
-
-
-def _prep_binary(gray):
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 7
-    )
-    return thr
-
-
-def _cell_fill_score(bin_img, cx, cy, r):
-    """
-    bin_img: THRESH_BINARY_INV (mực=255)
-    score = tỉ lệ pixel mực trong mask vòng tròn.
-    """
-    h, w = bin_img.shape[:2]
-    cx = int(cx); cy = int(cy); r = int(r)
-
-    x1 = max(0, cx - r); x2 = min(w, cx + r)
-    y1 = max(0, cy - r); y2 = min(h, cy + r)
-
-    roi = bin_img[y1:y2, x1:x2]
-    if roi.size == 0:
-        return 0.0
-
-    mask = np.zeros_like(roi, dtype=np.uint8)
-    # center trong ROI
-    cxi = min(r, roi.shape[1] - 1)
-    cyi = min(r, roi.shape[0] - 1)
-    cv2.circle(mask, (cxi, cyi), max(2, r - 2), 255, -1)
-
-    ink = cv2.bitwise_and(roi, roi, mask=mask)
-    filled = int(np.count_nonzero(ink))
-    total = int(np.count_nonzero(mask))
-    return float(filled) / float(total) if total > 0 else 0.0
-
-
-def _read_row_choice_scores(bin_img, rows, cols):
-    """
-    Tạo ma trận scores [rows][cols] theo lưới đều trong ROI.
-    """
-    h, w = bin_img.shape[:2]
-    r = int(min(w / (cols * 3.2), h / (rows * 3.2)))
-    r = max(6, min(16, r))
-
-    scores = []
-    for i in range(rows):
-        row = []
-        for j in range(cols):
-            cx = (j + 0.5) * (w / cols)
-            cy = (i + 0.5) * (h / rows)
-            row.append(_cell_fill_score(bin_img, cx, cy, r))
-        scores.append(row)
-    return scores
-
-
-def _pick_one(scores_row, threshold=FILL_THRESHOLD):
-    """
-    scores_row: list scores của các lựa chọn trong 1 câu (vd 4 lựa chọn A,B,C,D)
-    return: index hoặc None
-    """
-    best = int(np.argmax(scores_row))
-    sorted_scores = sorted(scores_row, reverse=True)
-    best_score = sorted_scores[0]
-    second = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
-
-    if best_score < threshold:
-        return None
-    if (best_score - second) < MIN_GAP:
-        return None
-    return best
-
-
-def _read_student_id(warped_bgr):
-    roi_img, box = _roi(warped_bgr, STUDENT_ROI)
-    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    bin_img = _prep_binary(gray)
-
-    h, w = bin_img.shape[:2]
-    col_w = w / STUDENT_COLS
-
-    digits = []
-    digit_scores = []
-
-    for c in range(STUDENT_COLS):
-        x1 = int(c * col_w)
-        x2 = int((c + 1) * col_w)
-        part = bin_img[:, x1:x2]  # 10 hàng, 1 cột
-
-        # scores 10x1
-        scores = _read_row_choice_scores(part, STUDENT_ROWS, 1)
-        col_scores = [scores[i][0] for i in range(STUDENT_ROWS)]
-
-        best_row = int(np.argmax(col_scores))
-        sorted_scores = sorted(col_scores, reverse=True)
-
-        if sorted_scores[0] < FILL_THRESHOLD:
-            digits.append(None)
-        elif (sorted_scores[0] - (sorted_scores[1] if len(sorted_scores) > 1 else 0.0)) < MIN_GAP:
-            digits.append(None)
-        else:
-            digits.append(best_row)
-
-        digit_scores.append(col_scores)
-
-    if any(d is None for d in digits):
-        return None, {
-            "student_roi": box,
-            "student_digits": digits,
-            "student_digit_scores": digit_scores
-        }
-
-    # ghép 3 chữ số
-    sid = "".join(str(d) for d in digits)
-    # chuẩn hoá bỏ số 0 đầu (nếu muốn)
-    sid_norm = str(int(sid)) if sid.isdigit() else sid
-
-    return sid_norm, {
-        "student_roi": box,
-        "student_digits": digits,
-        "student_id_raw": sid
-    }
-
-
-def _read_answers(warped_bgr, total_questions):
-    roi_img, box = _roi(warped_bgr, ANS_ROI)
-    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    bin_img = _prep_binary(gray)
-
-    # Coi ROI đáp án là grid: total_questions hàng x 4 cột (A,B,C,D)
-    scores = _read_row_choice_scores(bin_img, total_questions, 4)
-
-    answers = []
-    picks = []
-    for i in range(total_questions):
-        idx = _pick_one(scores[i])
-        picks.append(idx)
-        answers.append(CHOICES[idx] if idx is not None else None)
-
-    return answers, {
-        "answers_roi": box,
-        "answers_picks": picks,
-        # nếu debug bật thì sẽ trả thêm scores
-        "answers_scores": scores
-    }
-
-
-def _grade(answers, answer_key, pass_threshold):
-    total = len(answer_key)
-    score = 0
-    detected = 0
-    blank = 0
-    wrong = 0
-
-    for i in range(total):
-        a = answers[i]
-        if a is None or a == "":
-            blank += 1
-            continue
-        detected += 1
-        if str(a).upper() == str(answer_key[i]).upper():
-            score += 1
-        else:
-            wrong += 1
-
-    percentage = int(round((score / total) * 100))
-    status = "PASS" if percentage >= pass_threshold else "FAIL"
-
-    stats = {
-        "total_questions": total,
-        "detected_answers": detected,
-        "blank_answers": blank,
-        "wrong_answers": wrong,
-        "pass_threshold": pass_threshold
-    }
-
-    return score, percentage, status, stats
-
-
-if __name__ == "__main__":
-    # Railway/Heroku style
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+        return jsonify({
+            "success": False,
+            "error": f"Internal server error: {str(e)}"
+        }), 500
+
+
+# ========================
+# MAIN
+# ========================
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
