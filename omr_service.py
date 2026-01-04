@@ -1,427 +1,212 @@
 #!/usr/bin/env python3
 """
-QuickGrader OMR Service v4.0 (TNMaker-style stability)
-- Robust corner marker detection (square marker template + edge match in 4 corners)
-- Perspective warp to fixed canvas
-- Read Student ID (3 digits) + Answers (10 questions, A/B/C/D)
-- Optional debug overlay image (base64 jpeg) to verify alignment
+QuickGrader OMR – TNMaker-style (Refactored Single File)
+Author: ChatGPT (for Hai)
 """
 
-import os
-import cv2
+# =====================================================
+# MODULE 1 – IMPORTS & CONFIG
+# =====================================================
+import cv2, base64, os
 import numpy as np
-import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# ==================== CONFIG ====================
-WARP_W, WARP_H = 900, 1300
-
-# Marker match
-CORNER_SEARCH_FRAC = 0.38  # search area in each corner
-TPL_SIZE = 90              # synthetic marker template size
-SCALES = np.linspace(0.75, 1.45, 15)  # template scales to try
-EDGE1, EDGE2 = 50, 150
-
-# Quality
-BLUR_THRESHOLD = 25.0
-
-# Bubble detection thresholds (relative)
-# (đừng đặt quá cao vì HS tô nhạt sẽ rớt)
-MIN_FILLED_SCORE = 0.080
-MIN_GAP_SCORE = 0.020
-
+W, H = 900, 1300
 CHOICES = ["A", "B", "C", "D"]
 
-# ==================== ROI for YOUR SHEET ====================
-# These ROI values are normalized on the warped canvas (WARP_W x WARP_H)
-# Based on your provided sheet photo (ID block top-left, Answer block bottom-left)
+ROI_ID     = (0.08, 0.22, 0.42, 0.56)
+ROI_ANSWER = (0.05, 0.60, 0.72, 0.92)
 
-# Tight ROI just around the 3x10 ID bubbles (avoid headers/text)
-ID_BUBBLE_ROI = (0.105, 0.275, 0.405, 0.635)     # (x1,y1,x2,y2)
+FILL_TH = 0.12
+GAP_TH  = 0.04
 
-# Tight ROI around the A/B/C/D bubbles (exclude "Câu ..." text as much as possible)
-ANS_BUBBLE_ROI = (0.155, 0.585, 0.875, 0.930)    # (x1,y1,x2,y2)
-
-TOTAL_QUESTIONS_DEFAULT = 10
-
-# ==================== UTILS ====================
-def b64_to_img(b64: str):
-    if not b64:
-        return None
+# =====================================================
+# MODULE 2 – IMAGE IO & NORMALIZATION (TNMaker CORE)
+# =====================================================
+def b64_to_img(b64):
     if "," in b64:
-        b64 = b64.split(",", 1)[1]
-    try:
-        data = base64.b64decode(b64)
-        arr = np.frombuffer(data, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception:
+        b64 = b64.split(",")[1]
+    arr = np.frombuffer(base64.b64decode(b64), np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def normalize_gray(gray):
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    return clahe.apply(gray)
+
+def adaptive_bin(gray):
+    return cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35, 10
+    )
+
+# =====================================================
+# MODULE 3 – MARKER DETECTION & WARP
+# =====================================================
+def order_pts(pts):
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1)
+    return np.array([
+        pts[np.argmin(s)],
+        pts[np.argmin(d)],
+        pts[np.argmax(s)],
+        pts[np.argmax(d)]
+    ], dtype="float32")
+
+def find_markers(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    th = cv2.adaptiveThreshold(gray,255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,51,7)
+
+    cnts,_ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    pts = []
+
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < 300 or a > 20000: continue
+        p = cv2.arcLength(c, True)
+        if p == 0: continue
+        circ = 4*np.pi*a/(p*p)
+        if circ > 0.4:
+            (x,y),_ = cv2.minEnclosingCircle(c)
+            pts.append([x,y])
+
+    if len(pts) < 4:
         return None
 
-def check_blur(img_bgr):
-    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+    return order_pts(np.array(pts[:4]))
 
-def norm_roi(img, roi):
-    x1n, y1n, x2n, y2n = roi
-    h, w = img.shape[:2]
-    x1, y1 = int(x1n * w), int(y1n * h)
-    x2, y2 = int(x2n * w), int(y2n * h)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    return img[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+def warp(img, corners):
+    dst = np.array([[0,0],[W,0],[W,H],[0,H]], dtype="float32")
+    M = cv2.getPerspectiveTransform(corners, dst)
+    return cv2.warpPerspective(img, M, (W,H))
 
-def jpeg_b64(img_bgr, quality=85):
-    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        return ""
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
+def crop(img, roi):
+    h,w = img.shape[:2]
+    x1,y1,x2,y2 = int(roi[0]*w),int(roi[1]*h),int(roi[2]*w),int(roi[3]*h)
+    return img[y1:y2, x1:x2]
 
-# ==================== MARKER TEMPLATE MATCH ====================
-def gen_marker_template(size=TPL_SIZE, hole_ratio=0.35):
-    """
-    Synthetic marker like your sheet: black square with white inner square.
-    We'll match on edges so lighting doesn't matter much.
-    """
-    tpl = np.ones((size, size), dtype=np.uint8) * 255
-    cv2.rectangle(tpl, (0, 0), (size - 1, size - 1), 0, -1)
-    hole = int(size * hole_ratio)
-    s = (size - hole) // 2
-    cv2.rectangle(tpl, (s, s), (s + hole, s + hole), 255, -1)
-    tpl_edges = cv2.Canny(tpl, EDGE1, EDGE2)
-    return tpl_edges
+# =====================================================
+# MODULE 4 – BUBBLE DETECTION (NO GRID)
+# =====================================================
+def detect_circles(gray):
+    return cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT,
+        dp=1.2, minDist=18,
+        param1=80, param2=18,
+        minRadius=7, maxRadius=18
+    )
 
-def find_marker_in_corner(gray, corner, tpl_edges):
-    """
-    Search for marker in a corner region using multi-scale edge template matching.
-    Returns: ((x,y), score, (tw,th)) where (x,y) is top-left of match in FULL image.
-    """
-    H, W = gray.shape
-    rw, rh = int(W * CORNER_SEARCH_FRAC), int(H * CORNER_SEARCH_FRAC)
-
-    if corner == "tl":
-        x0, y0 = 0, 0
-    elif corner == "tr":
-        x0, y0 = W - rw, 0
-    elif corner == "bl":
-        x0, y0 = 0, H - rh
-    else:  # br
-        x0, y0 = W - rw, H - rh
-
-    roi = gray[y0:y0 + rh, x0:x0 + rw]
-    roi_edges = cv2.Canny(roi, EDGE1, EDGE2)
-
-    best_loc = None
-    best_score = -1.0
-    best_size = None
-
-    for s in SCALES:
-        th = int(tpl_edges.shape[1] * s)
-        tv = int(tpl_edges.shape[0] * s)
-        if th < 28 or tv < 28:
-            continue
-        if th >= roi_edges.shape[1] or tv >= roi_edges.shape[0]:
-            continue
-
-        tpl_rs = cv2.resize(tpl_edges, (th, tv), interpolation=cv2.INTER_AREA)
-        res = cv2.matchTemplate(roi_edges, tpl_rs, cv2.TM_CCOEFF_NORMED)
-        _, maxv, _, maxl = cv2.minMaxLoc(res)
-
-        if maxv > best_score:
-            best_score = float(maxv)
-            best_loc = (x0 + maxl[0], y0 + maxl[1])
-            best_size = (th, tv)
-
-    return best_loc, best_score, best_size
-
-def find_4_markers(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    tpl_edges = gen_marker_template()
-
-    found = {}
-    for c in ["tl", "tr", "bl", "br"]:
-        loc, score, sz = find_marker_in_corner(gray, c, tpl_edges)
-        found[c] = {"loc": loc, "score": score, "size": sz}
-
-    # validate
-    if any(found[k]["loc"] is None for k in found):
-        return None, {"markers_found": False, "found": found}
-
-    # Build centers
-    centers = {}
-    for k in found:
-        (x, y) = found[k]["loc"]
-        (tw, th) = found[k]["size"]
-        centers[k] = (x + tw / 2.0, y + th / 2.0)
-
-    return centers, {"markers_found": True, "found": found, "centers": centers}
-
-def warp_by_marker_centers(img_bgr, centers):
-    """
-    Warp using marker CENTERS to fixed positions inside the warped canvas.
-    This is stable across printing/cropping.
-    """
-    m = 60  # margin inside warp for marker centers
-    src = np.array([centers["tl"], centers["tr"], centers["br"], centers["bl"]], dtype=np.float32)
-    dst = np.array([[m, m], [WARP_W - m, m], [WARP_W - m, WARP_H - m], [m, WARP_H - m]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img_bgr, M, (WARP_W, WARP_H))
-    return warped
-
-# ==================== BUBBLE SCORING ====================
-def illumination_normalize(gray):
-    # Flat-field normalization to reduce shadows
-    blur = cv2.GaussianBlur(gray, (51, 51), 0)
-    norm = cv2.divide(gray, blur, scale=255)
-    return norm
-
-def bubble_score(gray_norm, cx, cy, r):
-    """
-    TNMaker-like: compare inner area darkness to surrounding background.
-    Score higher => more likely filled.
-    """
-    h, w = gray_norm.shape
-    cx, cy, r = int(round(cx)), int(round(cy)), int(round(r))
-    pad = int(r * 2.2)
-
-    x1, x2 = max(0, cx - pad), min(w, cx + pad)
-    y1, y2 = max(0, cy - pad), min(h, cy + pad)
-    roi = gray_norm[y1:y2, x1:x2]
+def fill_ratio(bin_img, x, y, r):
+    r = int(r * 0.55)
+    roi = bin_img[int(y-r):int(y+r), int(x-r):int(x+r)]
     if roi.size == 0:
         return 0.0
+    return np.count_nonzero(roi) / roi.size
 
-    yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
-    ccx, ccy = roi.shape[1] // 2, roi.shape[0] // 2
-    dist = np.sqrt((xx - ccx) ** 2 + (yy - ccy) ** 2)
+def kmeans_1d(vals, k):
+    vals = np.array(vals, dtype=np.float32).reshape(-1,1)
+    _, labels, centers = cv2.kmeans(
+        vals, k, None,
+        (cv2.TERM_CRITERIA_EPS, 10, 1.0),
+        10, cv2.KMEANS_PP_CENTERS
+    )
+    order = np.argsort(centers.flatten())
+    remap = {old:new for new,old in enumerate(order)}
+    return np.array([remap[l[0]] for l in labels])
 
-    inner = dist <= r * 0.55
-    bg = (dist >= r * 1.20) & (dist <= r * 1.75)
+# =====================================================
+# MODULE 5 – READ ID / READ ANSWERS
+# =====================================================
+def read_student_id(warped):
+    img = crop(warped, ROI_ID)
+    gray = normalize_gray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    bin_img = adaptive_bin(gray)
 
-    if inner.sum() < 20 or bg.sum() < 30:
-        return 0.0
+    circles = detect_circles(gray)
+    if circles is None:
+        return "0"
 
-    inner_mean = float(np.mean(roi[inner]))
-    bg_mean = float(np.mean(roi[bg]))
-    # filled => inner darker => lower mean => higher (bg - inner)
-    score = (bg_mean - inner_mean) / 255.0
-    return max(0.0, float(score))
-
-def build_grid_scores(gray_norm, rows, cols):
-    h, w = gray_norm.shape
-    dx, dy = w / cols, h / rows
-    r = int(min(dx, dy) * 0.22)
-    r = max(7, min(18, r))
-
-    scores = np.zeros((rows, cols), dtype=np.float32)
-    for i in range(rows):
-        for j in range(cols):
-            cx = (j + 0.5) * dx
-            cy = (i + 0.5) * dy
-            scores[i, j] = bubble_score(gray_norm, cx, cy, r)
-    return scores, r
-
-def pick_one(scores_row, min_score=MIN_FILLED_SCORE, min_gap=MIN_GAP_SCORE):
-    best = int(np.argmax(scores_row))
-    sorted_s = np.sort(scores_row)[::-1]
-    top = float(sorted_s[0])
-    second = float(sorted_s[1]) if len(sorted_s) > 1 else 0.0
-    if top < min_score:
-        return None
-    if (top - second) < min_gap:
-        return None
-    return best
-
-# ==================== READ ID + ANSWERS ====================
-def read_student_id(warped_bgr, debug=False):
-    roi_img, roi_box = norm_roi(warped_bgr, ID_BUBBLE_ROI)
-    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    gray_n = illumination_normalize(gray)
-
-    scores, r = build_grid_scores(gray_n, rows=10, cols=3)
+    c = circles[0]
+    rows = kmeans_1d(c[:,1], 10)
+    cols = kmeans_1d(c[:,0], 3)
 
     digits = []
     for col in range(3):
-        sel = pick_one(scores[:, col], min_score=0.070, min_gap=0.015)
-        digits.append(sel)
+        scores = [0]*10
+        for i in range(len(c)):
+            if cols[i] == col:
+                scores[rows[i]] = fill_ratio(bin_img, c[i][0], c[i][1], c[i][2])
+        sel = np.argmax(scores)
+        if scores[sel] < FILL_TH:
+            return "0"
+        digits.append(str(sel))
 
-    dbg = {"roi_box": roi_box, "radius": r}
-    if debug:
-        dbg["scores"] = scores.tolist()
-        dbg["digits"] = digits
+    return str(int("".join(digits)))
 
-    if any(d is None for d in digits):
-        return None, dbg
+def read_answers(warped):
+    img = crop(warped, ROI_ANSWER)
+    gray = normalize_gray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    bin_img = adaptive_bin(gray)
 
-    sid_raw = "".join(str(d) for d in digits)  # rows represent 0..9 top->bottom
-    try:
-        sid = str(int(sid_raw))  # remove leading zeros
-    except Exception:
-        sid = sid_raw
-    return sid, dbg
+    circles = detect_circles(gray)
+    if circles is None:
+        return [None]*10
 
-def read_answers(warped_bgr, total_q=TOTAL_QUESTIONS_DEFAULT, debug=False):
-    roi_img, roi_box = norm_roi(warped_bgr, ANS_BUBBLE_ROI)
-    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    gray_n = illumination_normalize(gray)
-
-    scores, r = build_grid_scores(gray_n, rows=total_q, cols=4)
+    c = circles[0]
+    rows = kmeans_1d(c[:,1], 10)
+    cols = kmeans_1d(c[:,0], 4)
 
     answers = []
-    picks = []
-    for i in range(total_q):
-        sel = pick_one(scores[i, :], min_score=0.080, min_gap=0.020)
-        picks.append(sel)
-        answers.append(CHOICES[sel] if sel is not None else None)
+    for q in range(10):
+        ratios = [0]*4
+        for opt in range(4):
+            for i in range(len(c)):
+                if rows[i]==q and cols[i]==opt:
+                    ratios[opt] = fill_ratio(bin_img, c[i][0], c[i][1], c[i][2])
+        best = np.argmax(ratios)
+        s = sorted(ratios, reverse=True)
+        if s[0] > FILL_TH and s[0]-s[1] > GAP_TH:
+            answers.append(CHOICES[best])
+        else:
+            answers.append(None)
+    return answers
 
-    dbg = {"roi_box": roi_box, "radius": r}
-    if debug:
-        dbg["scores"] = scores.tolist()
-        dbg["picks"] = picks
-    return answers, dbg
-
-def grade(student_ans, key, threshold):
-    total = len(key)
-    score = 0
-    for i in range(total):
-        a = (student_ans[i] or "").strip().upper()
-        k = (str(key[i]) or "").strip().upper()
-        if a and a == k:
-            score += 1
-    pct = int(round((score / total) * 100)) if total > 0 else 0
-    status = "PASS" if pct >= int(threshold) else "FAIL"
-    return score, pct, status
-
-def make_debug_overlay(warped, sid_dbg, ans_dbg, sid, answers):
-    """
-    Draw ROIs and selected cells to visually verify.
-    """
-    out = warped.copy()
-
-    # Draw ROIs
-    for name, (x1,y1,x2,y2) in [
-        ("ID", sid_dbg.get("roi_box", (0,0,0,0))),
-        ("ANS", ans_dbg.get("roi_box", (0,0,0,0))),
-    ]:
-        cv2.rectangle(out, (x1,y1), (x2,y2), (0,255,0), 2)
-        cv2.putText(out, name, (x1+8, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
-    # Mark chosen ID bubbles (approx centers)
-    try:
-        (x1,y1,x2,y2) = sid_dbg["roi_box"]
-        w = x2-x1; h = y2-y1
-        cols, rows = 3, 10
-        dx, dy = w/cols, h/rows
-        r = int(sid_dbg.get("radius", 12))
-        if sid:
-            # rebuild digits with leading zeros by scores argmax if available
-            digits = sid_dbg.get("digits", None)
-            if digits and len(digits)==3:
-                for j, d in enumerate(digits):
-                    if d is None: continue
-                    cx = int(x1 + (j+0.5)*dx)
-                    cy = int(y1 + (d+0.5)*dy)
-                    cv2.circle(out, (cx,cy), r, (0,0,255), 2)
-    except Exception:
-        pass
-
-    # Mark chosen answers
-    try:
-        (x1,y1,x2,y2) = ans_dbg["roi_box"]
-        w = x2-x1; h = y2-y1
-        cols, rows = 4, len(answers)
-        dx, dy = w/cols, h/rows
-        r = int(ans_dbg.get("radius", 12))
-        for i,a in enumerate(answers):
-            if not a: continue
-            j = CHOICES.index(a)
-            cx = int(x1 + (j+0.5)*dx)
-            cy = int(y1 + (i+0.5)*dy)
-            cv2.circle(out, (cx,cy), r, (255,0,0), 2)
-    except Exception:
-        pass
-
-    return out
-
-# ==================== API ====================
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "QuickGrader OMR v4.0"}), 200
-
+# =====================================================
+# MODULE 6 – API
+# =====================================================
 @app.route("/process_omr", methods=["POST"])
 def process_omr():
-    try:
-        data = request.json or {}
-        image_data = data.get("image") or data.get("image_base64")
-        answer_key = data.get("answer_key", [])
-        total_q = int(data.get("total_questions", len(answer_key) or TOTAL_QUESTIONS_DEFAULT))
-        threshold = int(data.get("pass_threshold", 80))
-        debug = bool(data.get("debug", False))
+    data = request.json
+    img = b64_to_img(data["image"])
+    answer_key = data["answer_key"]
 
-        if not image_data:
-            return jsonify({"success": False, "error": "Missing image"}), 400
-        if not answer_key:
-            return jsonify({"success": False, "error": "Missing answer_key"}), 400
+    corners = find_markers(img)
+    if corners is None:
+        return jsonify({"success": False, "error": "marker_not_found"})
 
-        img = b64_to_img(image_data)
-        if img is None:
-            return jsonify({"success": False, "error": "Invalid image"}), 400
+    warped = warp(img, corners)
 
-        blur_var = check_blur(img)
-        if blur_var < BLUR_THRESHOLD:
-            return jsonify({
-                "success": False,
-                "error": "Image too blurry",
-                "blur_variance": round(blur_var, 2)
-            }), 422
+    sid = read_student_id(warped)
+    answers = read_answers(warped)
 
-        centers, m_dbg = find_4_markers(img)
-        if centers is None:
-            return jsonify({"success": False, "error": "Cannot find 4 markers", "debug": m_dbg}), 422
+    score = sum(1 for i in range(10) if answers[i] == answer_key[i])
+    pct = score * 10
 
-        warped = warp_by_marker_centers(img, centers)
-
-        student_id, sid_dbg = read_student_id(warped, debug=debug)
-        answers, ans_dbg = read_answers(warped, total_q=total_q, debug=debug)
-
-        if student_id is None:
-            # still return answers; but flag warning
-            student_id = ""
-            sid_warn = True
-        else:
-            sid_warn = False
-
-        score, pct, status = grade(answers, answer_key, threshold)
-
-        resp = {
-            "success": True,
-            "student_id": str(student_id),
-            "student_name": f"Hoc sinh {student_id}" if student_id else "",
-            "answers": [a if a else "" for a in answers],
-            "score": score,
-            "percentage": pct,
-            "status": status,
-            "warnings": []
-        }
-        if sid_warn:
-            resp["warnings"].append("Không đọc được mã HS (ID)")
-
-        if debug:
-            overlay = make_debug_overlay(warped, sid_dbg, ans_dbg, student_id, answers)
-            resp["debug"] = {
-                "marker": m_dbg,
-                "student_id": sid_dbg,
-                "answers": ans_dbg,
-                "overlay_jpg_base64": jpeg_b64(overlay, quality=85)
-            }
-
-        return jsonify(resp), 200
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({
+        "success": True,
+        "student_id": sid,
+        "answers": answers,
+        "score": score,
+        "percentage": pct,
+        "status": "PASS" if pct >= 80 else "FAIL"
+    })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run("0.0.0.0", 8000)
