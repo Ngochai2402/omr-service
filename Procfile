@@ -1,6 +1,1 @@
-Flask==3.0.0
-Flask-CORS==4.0.0
-opencv-python-headless==4.8.1.78
-numpy==1.24.3
-imutils==0.5.4
-gunicorn==21.2.0
+web: gunicorn omr_service:app --workers 2 --timeout 120
