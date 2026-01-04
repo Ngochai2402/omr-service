@@ -1,357 +1,474 @@
-# omr_service.py
-import base64
-import binascii
-import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any
+#!/usr/bin/env python3
+"""
+Script Python đơn giản để chấm phiếu trắc nghiệm
+Không cần Flask, chạy trực tiếp từ command line
+"""
 
-import numpy as np
 import cv2
-from flask import Flask, request, jsonify
+import numpy as np
+import sys
+import os
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024  # 12MB
+# ==================== CẤU HÌNH ====================
 
-# =========================
-# Helpers
-# =========================
+# Kích thước canvas sau khi căn chỉnh
+WARP_W, WARP_H = 900, 1300
+MARKER_MARGIN = 60
 
-def decode_image_base64(image_base64: str) -> np.ndarray:
-    """Accept raw base64 or dataURL: data:image/jpeg;base64,... -> return BGR image."""
-    if not image_base64 or not isinstance(image_base64, str):
-        raise ValueError("image_base64 missing or not a string")
+# Ngưỡng phát hiện
+MIN_FILLED_SCORE = 0.08  # Điểm tối thiểu để coi là đã tô
+MIN_GAP_SCORE = 0.02     # Khoảng cách giữa câu trả lời đúng nhất và thứ 2
 
-    s = image_base64.strip()
-    if s.startswith("data:"):
-        if "," not in s:
-            raise ValueError("Invalid data URL (missing comma)")
-        s = s.split(",", 1)[1].strip()
+# Vùng ROI (x1, y1, x2, y2) - tọa độ chuẩn hóa 0-1
+ID_ROI = (0.15, 0.15, 0.70, 0.45)       # Vùng ID học sinh
+ANSWER_ROI = (0.10, 0.50, 0.90, 0.92)   # Vùng đáp án
 
-    s = "".join(s.split())
-    try:
-        raw = base64.b64decode(s, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise ValueError(f"Invalid base64: {e}")
+# Layout phiếu
+ID_COLS = 3      # 3 cột (Trăm, Chục, Đơn vị)
+ID_ROWS = 10     # 10 hàng (0-9)
+ANS_ROWS = 10    # 10 câu hỏi
+ANS_COLS = 4     # 4 đáp án (A, B, C, D)
 
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("cv2.imdecode failed (not a valid image bytes)")
-    return img
+CHOICES = ["A", "B", "C", "D"]
 
+# ==================== HÀM PHỤ TRỢ ====================
 
-def order_points(pts: np.ndarray) -> np.ndarray:
-    """Order 4 points: tl, tr, br, bl."""
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # tl
-    rect[2] = pts[np.argmax(s)]  # br
-    diff = np.diff(pts, axis=1).reshape(-1)
-    rect[1] = pts[np.argmin(diff)]  # tr
-    rect[3] = pts[np.argmax(diff)]  # bl
-    return rect
-
-
-def find_corner_markers(img_bgr: np.ndarray) -> np.ndarray:
+def tim_4_goc(img):
     """
-    Find 4 black circular-ish markers near corners.
-    Return 4 points (tl,tr,br,bl) in original image coordinates.
+    Tìm 4 góc đen của phiếu
+    Return: 4 điểm góc [TL, TR, BR, BL] hoặc None
     """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # tăng tương phản nhẹ
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # threshold đảo để marker đen -> trắng (dễ đếm)
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # làm sạch
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    h, w = gray.shape[:2]
-    candidates = []
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Phát hiện cạnh
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, np.ones((5,5), np.uint8), iterations=2)
+    
+    # Tìm contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Lọc các contour hình vuông (markers)
+    markers = []
+    h, w = img.shape[:2]
+    min_area = (w * h) * 0.001  # Tối thiểu 0.1% diện tích ảnh
+    max_area = (w * h) * 0.05   # Tối đa 5% diện tích ảnh
+    
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < (w * h) * 0.0002:  # lọc nhiễu nhỏ
-            continue
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw < 10 or ch < 10:
-            continue
-
-        # độ tròn tương đối (circularity)
-        peri = cv2.arcLength(cnt, True)
-        if peri <= 0:
-            continue
-        circularity = 4 * math.pi * area / (peri * peri)
-
-        # marker tròn: circularity ~ 0.6-1.0 (nới lỏng để chịu ảnh chụp lệch)
-        if circularity < 0.45:
-            continue
-
-        # tâm
-        M = cv2.moments(cnt)
-        if M["m00"] == 0:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-
-        candidates.append((area, cx, cy))
-
-    if len(candidates) < 4:
-        raise ValueError("Không tìm đủ 4 marker góc. Hãy chụp rõ 4 góc và marker đen.")
-
-    # lấy top marker theo diện tích
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    top = candidates[:12]  # dự phòng có logo/đốm lớn
-    pts = np.array([[c[1], c[2]] for c in top], dtype=np.float32)
-
-    # chọn 4 điểm gần 4 góc nhất:
+        if min_area < area < max_area:
+            # Xấp xỉ hình dạng
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            
+            # Kiểm tra có phải hình vuông (4 góc)
+            if len(approx) == 4:
+                x, y, w_rect, h_rect = cv2.boundingRect(approx)
+                aspect_ratio = float(w_rect) / h_rect
+                
+                # Tỷ lệ gần vuông (0.8 - 1.2)
+                if 0.8 < aspect_ratio < 1.2:
+                    # Lấy tâm của marker
+                    M = cv2.moments(cnt)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        markers.append((cx, cy))
+    
+    if len(markers) < 4:
+        print(f"❌ Chỉ tìm thấy {len(markers)}/4 góc!")
+        return None
+    
+    # Sắp xếp 4 góc: TL, TR, BR, BL
+    markers = sorted(markers, key=lambda p: p[1])  # Sắp xếp theo Y
+    top_2 = sorted(markers[:2], key=lambda p: p[0])  # 2 góc trên, sắp xếp theo X
+    bottom_2 = sorted(markers[2:4], key=lambda p: p[0])  # 2 góc dưới
+    
     corners = np.array([
-        [0, 0],
-        [w, 0],
-        [w, h],
-        [0, h]
+        top_2[0],      # Top-Left
+        top_2[1],      # Top-Right
+        bottom_2[1],   # Bottom-Right
+        bottom_2[0]    # Bottom-Left
     ], dtype=np.float32)
-
-    chosen = []
-    used = set()
-    for ci in range(4):
-        cx, cy = corners[ci]
-        dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
-        # chọn điểm gần nhất góc, chưa dùng
-        order = np.argsort(dists)
-        pick = None
-        for idx in order:
-            if idx not in used:
-                pick = idx
-                break
-        if pick is None:
-            raise ValueError("Marker góc bị trùng/không phân biệt được.")
-        used.add(pick)
-        chosen.append(pts[pick])
-
-    chosen = np.array(chosen, dtype=np.float32)
-    rect = order_points(chosen)  # tl,tr,br,bl
-    return rect
+    
+    return corners
 
 
-def warp_to_a4(img_bgr: np.ndarray, rect: np.ndarray, out_w: int = 1654, out_h: int = 2339) -> np.ndarray:
+def can_chinh_phieu(img, corners):
     """
-    Warp theo 4 marker về khung A4 chuẩn.
-    Mặc định 1654x2339 ~ A4 @200dpi-ish (đủ cho OMR).
+    Căn chỉnh phiếu về dạng thẳng
     """
     dst = np.array([
-        [0, 0],
-        [out_w - 1, 0],
-        [out_w - 1, out_h - 1],
-        [0, out_h - 1],
+        [MARKER_MARGIN, MARKER_MARGIN],
+        [WARP_W - MARKER_MARGIN, MARKER_MARGIN],
+        [WARP_W - MARKER_MARGIN, WARP_H - MARKER_MARGIN],
+        [MARKER_MARGIN, WARP_H - MARKER_MARGIN]
     ], dtype=np.float32)
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(img_bgr, M, (out_w, out_h))
+    
+    M = cv2.getPerspectiveTransform(corners, dst)
+    warped = cv2.warpPerspective(img, M, (WARP_W, WARP_H))
+    
     return warped
 
 
-def binarize_for_marking(warped_bgr: np.ndarray) -> np.ndarray:
-    """Return binary image where filled marks are 1 (white) after invert."""
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    # tô đen -> trắng
-    th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    return th
+def lay_roi(img, roi_norm):
+    """
+    Lấy vùng ROI từ tọa độ chuẩn hóa
+    """
+    x1n, y1n, x2n, y2n = roi_norm
+    h, w = img.shape[:2]
+    
+    x1 = int(x1n * w)
+    y1 = int(y1n * h)
+    x2 = int(x2n * w)
+    y2 = int(y2n * h)
+    
+    return img[y1:y2, x1:x2], (x1, y1, x2, y2)
 
 
-@dataclass
-class GridSpec:
-    x: float  # left ratio 0..1
-    y: float  # top ratio
-    w: float  # width ratio
-    h: float  # height ratio
-    rows: int
-    cols: int
+def chuan_hoa_sang(gray):
+    """
+    Chuẩn hóa độ sáng để giảm ảnh hưởng của bóng
+    """
+    bg = cv2.GaussianBlur(gray, (51, 51), 0)
+    bg = np.where(bg == 0, 1, bg)
+    
+    normalized = cv2.divide(gray.astype(np.float32), bg.astype(np.float32))
+    normalized = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
+    
+    return normalized.astype(np.uint8)
 
 
-def cell_rect(spec: GridSpec, r: int, c: int, W: int, H: int) -> Tuple[int, int, int, int]:
-    x0 = int(spec.x * W)
-    y0 = int(spec.y * H)
-    ww = int(spec.w * W)
-    hh = int(spec.h * H)
-    cw = ww / spec.cols
-    ch = hh / spec.rows
-    x = int(x0 + c * cw)
-    y = int(y0 + r * ch)
-    return x, y, int(cw), int(ch)
-
-
-def mark_score(th_inv: np.ndarray, x: int, y: int, w: int, h: int, pad: int = 3) -> float:
-    """Compute fill ratio inside cell (higher = more filled)."""
-    H, W = th_inv.shape[:2]
-    x1 = max(0, x + pad)
-    y1 = max(0, y + pad)
-    x2 = min(W, x + w - pad)
-    y2 = min(H, y + h - pad)
-    roi = th_inv[y1:y2, x1:x2]
+def tinh_diem_o_tron(binary, cx, cy, r):
+    """
+    Tính điểm của ô tròn (cao = đã tô đậm)
+    """
+    h, w = binary.shape
+    cx, cy, r = int(cx), int(cy), int(r)
+    
+    x1 = max(0, cx - r)
+    x2 = min(w, cx + r)
+    y1 = max(0, cy - r)
+    y2 = min(h, cy + r)
+    
+    roi = binary[y1:y2, x1:x2]
     if roi.size == 0:
         return 0.0
-    # th_inv: filled mark ~ white(255)
-    return float(np.count_nonzero(roi)) / float(roi.size)
+    
+    # Tạo mask hình tròn
+    mask = np.zeros_like(roi, dtype=np.uint8)
+    roi_h, roi_w = roi.shape
+    mask_cx = min(r, roi_w // 2)
+    mask_cy = min(r, roi_h // 2)
+    
+    # Vòng tròn bên trong (ô tô)
+    inner_r = max(2, int(r * 0.6))
+    cv2.circle(mask, (mask_cx, mask_cy), inner_r, 255, -1)
+    inner_mean = cv2.mean(roi, mask=mask)[0]
+    
+    # Vòng tròn bên ngoài (nền)
+    ring_mask = np.zeros_like(roi, dtype=np.uint8)
+    outer_r = max(inner_r + 2, int(r * 0.9))
+    cv2.circle(ring_mask, (mask_cx, mask_cy), outer_r, 255, -1)
+    cv2.circle(ring_mask, (mask_cx, mask_cy), inner_r, 0, -1)
+    
+    if cv2.countNonZero(ring_mask) > 0:
+        bg_mean = cv2.mean(roi, mask=ring_mask)[0]
+    else:
+        bg_mean = 255
+    
+    # Điểm = (nền - trong) / 255 (càng cao = tô càng đậm)
+    score = (bg_mean - inner_mean) / 255.0
+    return max(0.0, score)
 
 
-def read_one_choice_per_row(th_inv: np.ndarray, spec: GridSpec, choices: List[str], min_fill: float = 0.18) -> Tuple[List[Optional[str]], List[Dict[str, Any]]]:
+def doc_luoi_diem(binary, rows, cols):
     """
-    Each row: select max-filled among cols.
-    Return answers + debug per row.
+    Đọc điểm của tất cả ô trong lưới
     """
-    H, W = th_inv.shape[:2]
-    out = []
-    dbg = []
-    for r in range(spec.rows):
-        scores = []
-        for c in range(spec.cols):
-            x, y, cw, ch = cell_rect(spec, r, c, W, H)
-            s = mark_score(th_inv, x, y, cw, ch)
-            scores.append(s)
-        best = int(np.argmax(scores))
-        best_s = scores[best]
-        # kiểm tra đậm đủ
-        if best_s < min_fill:
-            out.append(None)
-            status = "blank"
-        else:
-            # nếu 2 ô cùng đậm (tô 2 đáp án)
-            sorted_scores = sorted(scores, reverse=True)
-            if len(sorted_scores) >= 2 and (sorted_scores[0] - sorted_scores[1]) < 0.03 and sorted_scores[1] >= min_fill:
-                out.append(None)
-                status = "multi"
-            else:
-                out.append(choices[best])
-                status = "ok"
-        dbg.append({"row": r, "scores": [round(x, 3) for x in scores], "status": status})
-    return out, dbg
+    h, w = binary.shape
+    cell_w = w / cols
+    cell_h = h / rows
+    r = int(min(cell_w, cell_h) * 0.3)
+    r = max(5, min(30, r))
+    
+    scores = []
+    for i in range(rows):
+        row_scores = []
+        for j in range(cols):
+            cx = (j + 0.5) * cell_w
+            cy = (i + 0.5) * cell_h
+            score = tinh_diem_o_tron(binary, cx, cy, r)
+            row_scores.append(score)
+        scores.append(row_scores)
+    
+    return scores
 
 
-# =========================
-# Layout Specs (PHÙ HỢP mẫu HTML bên dưới)
-# =========================
-# A4 warped size: 1654 x 2339
-# - Mã học sinh: 10 cột (0..9), mỗi cột 10 hàng (digit 0..9)
-# - Đáp án: 40 câu, 4 lựa chọn A,B,C,D
-
-STUDENT_ID_SPEC = GridSpec(
-    x=0.12, y=0.15, w=0.76, h=0.20,
-    rows=10, cols=10
-)
-# Trong spec này: rows = 10 (digit 0..9), cols = 10 (vị trí chữ số 1..10)
-# => ta đọc theo COL: mỗi cột chọn 1 hàng -> digit
-
-ANSWER_SPEC = GridSpec(
-    x=0.12, y=0.40, w=0.76, h=0.50,
-    rows=40, cols=4
-)
-
-DIGITS = [str(i) for i in range(10)]
-ABCD = ["A", "B", "C", "D"]
-
-
-def read_student_id(th_inv: np.ndarray, spec: GridSpec, min_fill: float = 0.18) -> Tuple[str, Dict[str, Any]]:
+def chon_o_tron(scores_row):
     """
-    spec rows=10 digits, cols=10 positions
-    Read each column -> choose one row => digit.
+    Chọn ô tròn được tô trong 1 hàng
+    Return: index của ô được chọn hoặc None
     """
-    H, W = th_inv.shape[:2]
+    if not scores_row:
+        return None
+    
+    sorted_scores = sorted(enumerate(scores_row), key=lambda x: x[1], reverse=True)
+    
+    best_idx, best_score = sorted_scores[0]
+    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+    
+    # Kiểm tra ngưỡng
+    if best_score < MIN_FILLED_SCORE:
+        return None
+    
+    gap = best_score - second_score
+    if gap < MIN_GAP_SCORE:
+        return None  # Không rõ ràng (tô 2 ô hoặc tô mờ)
+    
+    return best_idx
+
+
+def doc_ma_so_hoc_sinh(warped):
+    """
+    Đọc mã số học sinh (3 cột x 10 hàng)
+    """
+    roi_img, box = lay_roi(warped, ID_ROI)
+    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+    
+    # Chuẩn hóa sáng
+    normalized = chuan_hoa_sang(gray)
+    
+    # Chuyển sang nhị phân
+    binary = cv2.adaptiveThreshold(
+        normalized, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 5
+    )
+    
+    # Đọc điểm
+    scores = doc_luoi_diem(binary, ID_ROWS, ID_COLS)
+    
+    # Chọn số cho mỗi cột
     digits = []
-    debug_cols = []
-    for c in range(spec.cols):
-        scores = []
-        for r in range(spec.rows):
-            x, y, cw, ch = cell_rect(spec, r, c, W, H)
-            s = mark_score(th_inv, x, y, cw, ch)
-            scores.append(s)
-        best_r = int(np.argmax(scores))
-        best_s = scores[best_r]
+    for col in range(ID_COLS):
+        col_scores = [scores[row][col] for row in range(ID_ROWS)]
+        selected = chon_o_tron(col_scores)
+        digits.append(selected if selected is not None else 0)
+    
+    # Ghép thành mã số
+    ma_so = "".join(str(d) for d in digits)
+    ma_so_int = int(ma_so)
+    
+    return str(ma_so_int), digits, scores
 
-        if best_s < min_fill:
-            digits.append("?")
-            status = "blank"
+
+def doc_dap_an(warped, so_cau):
+    """
+    Đọc đáp án (N câu x 4 cột ABCD)
+    """
+    roi_img, box = lay_roi(warped, ANSWER_ROI)
+    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+    
+    # Chuẩn hóa sáng
+    normalized = chuan_hoa_sang(gray)
+    
+    # Chuyển sang nhị phân
+    binary = cv2.adaptiveThreshold(
+        normalized, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 5
+    )
+    
+    # Đọc điểm
+    scores = doc_luoi_diem(binary, so_cau, ANS_COLS)
+    
+    # Chọn đáp án cho mỗi câu
+    answers = []
+    picks = []
+    
+    for i in range(so_cau):
+        selected = chon_o_tron(scores[i])
+        picks.append(selected)
+        
+        if selected is None:
+            answers.append("")
         else:
-            sorted_scores = sorted(scores, reverse=True)
-            if len(sorted_scores) >= 2 and (sorted_scores[0] - sorted_scores[1]) < 0.03 and sorted_scores[1] >= min_fill:
-                digits.append("?")
-                status = "multi"
-            else:
-                digits.append(str(best_r))
-                status = "ok"
-
-        debug_cols.append({"col": c, "scores": [round(x, 3) for x in scores], "status": status})
-
-    return "".join(digits), {"min_fill": min_fill, "cols": debug_cols}
+            answers.append(CHOICES[selected])
+    
+    return answers, picks, scores
 
 
-# =========================
-# API
-# =========================
-
-@app.post("/process_omr")
-def process_omr():
-    try:
-        data = request.get_json(force=True, silent=False)
-        if not data:
-            return jsonify({"ok": False, "error": "Empty JSON body"}), 400
-
-        image_base64 = data.get("image_base64") or data.get("image")
-        if not image_base64:
-            return jsonify({"ok": False, "error": "Missing image_base64 (or image)"}), 400
-
-        answer_key = data.get("answer_key")  # optional
-        pass_threshold = float(data.get("pass_threshold", 90))
-
-        img = decode_image_base64(image_base64)
-
-        rect = find_corner_markers(img)
-        warped = warp_to_a4(img, rect, out_w=1654, out_h=2339)
-        th_inv = binarize_for_marking(warped)
-
-        student_id, sid_debug = read_student_id(th_inv, STUDENT_ID_SPEC, min_fill=0.18)
-
-        answers, ans_debug = read_one_choice_per_row(th_inv, ANSWER_SPEC, ABCD, min_fill=0.18)
-
-        # scoring if answer_key provided
-        score = None
-        correct = None
-        passed = None
-        if isinstance(answer_key, list) and len(answer_key) == 40:
-            correct = 0
-            for i in range(40):
-                if answers[i] is not None and str(answers[i]).upper() == str(answer_key[i]).upper():
-                    correct += 1
-            score = round(correct * 100.0 / 40.0, 2)
-            passed = score >= pass_threshold
-
-        return jsonify({
-            "ok": True,
-            "student_id": student_id,
-            "answers": answers,
-            "score": score,
-            "correct": correct,
-            "passed": passed,
-            "debug": {
-                "student_id": sid_debug,
-                "answers": ans_debug,
-                "note": "Nếu hay bị '?': tăng min_fill hoặc in đậm vòng tròn hơn / chụp sáng hơn."
-            }
-        }), 200
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+def cham_diem(dap_an_hoc_sinh, dap_an_dung, nguong_dat):
+    """
+    Chấm điểm
+    """
+    tong_cau = len(dap_an_dung)
+    diem = 0
+    
+    for i in range(tong_cau):
+        if dap_an_hoc_sinh[i] and dap_an_hoc_sinh[i].upper() == dap_an_dung[i].upper():
+            diem += 1
+    
+    phan_tram = int(round((diem / tong_cau) * 100)) if tong_cau > 0 else 0
+    trang_thai = "ĐẠT" if phan_tram >= nguong_dat else "CHƯA ĐẠT"
+    
+    return diem, phan_tram, trang_thai
 
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True}), 200
+def ve_ket_qua(warped, id_digits, answer_picks):
+    """
+    Vẽ kết quả lên ảnh để debug
+    """
+    result_img = warped.copy()
+    
+    # Vẽ ROI ID
+    roi_img, (x1, y1, x2, y2) = lay_roi(warped, ID_ROI)
+    cv2.rectangle(result_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(result_img, "ID", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    # Vẽ các ô được chọn cho ID
+    roi_h = y2 - y1
+    roi_w = x2 - x1
+    cell_w = roi_w / ID_COLS
+    cell_h = roi_h / ID_ROWS
+    
+    for col, digit in enumerate(id_digits):
+        if digit is not None:
+            cx = x1 + int((col + 0.5) * cell_w)
+            cy = y1 + int((digit + 0.5) * cell_h)
+            cv2.circle(result_img, (cx, cy), 12, (0, 0, 255), 3)
+    
+    # Vẽ ROI đáp án
+    roi_img, (x1, y1, x2, y2) = lay_roi(warped, ANSWER_ROI)
+    cv2.rectangle(result_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+    cv2.putText(result_img, "DAP AN", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    
+    # Vẽ các ô được chọn cho đáp án
+    roi_h = y2 - y1
+    roi_w = x2 - x1
+    cell_w = roi_w / ANS_COLS
+    cell_h = roi_h / ANS_ROWS
+    
+    for row, pick in enumerate(answer_picks):
+        if pick is not None:
+            cx = x1 + int((pick + 0.5) * cell_w)
+            cy = y1 + int((row + 0.5) * cell_h)
+            cv2.circle(result_img, (cx, cy), 12, (0, 0, 255), 3)
+    
+    return result_img
 
+
+# ==================== HÀM CHÍNH ====================
+
+def cham_phieu(duong_dan_anh, dap_an_dung, nguong_dat=80, luu_ket_qua=True):
+    """
+    Hàm chính để chấm phiếu
+    
+    Args:
+        duong_dan_anh: Đường dẫn đến ảnh phiếu
+        dap_an_dung: List đáp án đúng, VD: ["A","B","C","D","A","B","C","D","A","B"]
+        nguong_dat: Phần trăm để đạt (mặc định 80%)
+        luu_ket_qua: Có lưu ảnh kết quả không
+    
+    Returns:
+        Dictionary chứa kết quả
+    """
+    
+    print("="*60)
+    print("🎓 BẮT ĐẦU CHẤM PHIẾU")
+    print("="*60)
+    
+    # 1. Đọc ảnh
+    print("📸 Đọc ảnh:", duong_dan_anh)
+    img = cv2.imread(duong_dan_anh)
+    if img is None:
+        print("❌ Không đọc được ảnh!")
+        return None
+    
+    print(f"✅ Kích thước ảnh: {img.shape[1]}x{img.shape[0]}")
+    
+    # 2. Tìm 4 góc
+    print("🔍 Tìm 4 góc marker...")
+    corners = tim_4_goc(img)
+    if corners is None:
+        print("❌ Không tìm thấy đủ 4 góc!")
+        return None
+    
+    print("✅ Đã tìm thấy 4 góc")
+    
+    # 3. Căn chỉnh phiếu
+    print("📐 Căn chỉnh phiếu...")
+    warped = can_chinh_phieu(img, corners)
+    print("✅ Đã căn chỉnh")
+    
+    # 4. Đọc mã số học sinh
+    print("🔢 Đọc mã số học sinh...")
+    ma_so, id_digits, id_scores = doc_ma_so_hoc_sinh(warped)
+    print(f"✅ Mã số: {ma_so}")
+    
+    # 5. Đọc đáp án
+    print("📝 Đọc đáp án...")
+    dap_an, answer_picks, ans_scores = doc_dap_an(warped, len(dap_an_dung))
+    print(f"✅ Đáp án: {dap_an}")
+    
+    # 6. Chấm điểm
+    print("📊 Chấm điểm...")
+    diem, phan_tram, trang_thai = cham_diem(dap_an, dap_an_dung, nguong_dat)
+    
+    # 7. Hiển thị kết quả
+    print("\n" + "="*60)
+    print("📋 KẾT QUẢ CHẤM PHIẾU")
+    print("="*60)
+    print(f"👤 Mã số học sinh: {ma_so}")
+    print(f"📝 Đáp án học sinh: {' '.join(dap_an)}")
+    print(f"✅ Đáp án đúng:     {' '.join(dap_an_dung)}")
+    print(f"📊 Điểm: {diem}/{len(dap_an_dung)}")
+    print(f"📈 Phần trăm: {phan_tram}%")
+    print(f"🎯 Kết quả: {trang_thai}")
+    print("="*60)
+    
+    # 8. Lưu ảnh kết quả
+    if luu_ket_qua:
+        result_img = ve_ket_qua(warped, id_digits, answer_picks)
+        output_path = duong_dan_anh.replace(".", "_result.")
+        cv2.imwrite(output_path, result_img)
+        print(f"💾 Đã lưu ảnh kết quả: {output_path}")
+    
+    # 9. Trả về kết quả
+    return {
+        "ma_so": ma_so,
+        "dap_an": dap_an,
+        "diem": diem,
+        "phan_tram": phan_tram,
+        "trang_thai": trang_thai,
+        "id_digits": id_digits,
+        "answer_picks": answer_picks
+    }
+
+
+# ==================== CHẠY THỬ ====================
 
 if __name__ == "__main__":
-    # local run: python omr_service.py
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    # Kiểm tra tham số
+    if len(sys.argv) < 2:
+        print("Cách sử dụng:")
+        print("  python cham_phieu_don_gian.py <đường_dẫn_ảnh>")
+        print("\nVí dụ:")
+        print("  python cham_phieu_don_gian.py phieu_hoc_sinh_1.jpg")
+        sys.exit(1)
+    
+    duong_dan_anh = sys.argv[1]
+    
+    # Đáp án mẫu (thay đổi theo đề của bạn)
+    dap_an_dung = ["A", "B", "C", "D", "A", "B", "C", "D", "A", "B"]
+    
+    # Chấm phiếu
+    ket_qua = cham_phieu(duong_dan_anh, dap_an_dung, nguong_dat=80, luu_ket_qua=True)
+    
+    if ket_qua:
+        print("\n✅ Chấm phiếu thành công!")
+    else:
+        print("\n❌ Chấm phiếu thất bại!")
