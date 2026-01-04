@@ -1,1 +1,6 @@
-web: gunicorn omr_service:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2
+Flask==3.0.0
+Flask-CORS==4.0.0
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+imutils==0.5.4
+gunicorn==21.2.0
