@@ -1,193 +1,232 @@
-# QuickGrader OMR Service
+# QuickGrader OMR Service v3.0
 
-Dịch vụ nhận dạng phiếu trắc nghiệm (OMR - Optical Mark Recognition) cho hệ thống QuickGrader.
+Hệ thống chấm bài trắc nghiệm tự động bằng OpenCV - Tích hợp với QuickGrader App
 
-## 📋 Tính năng
+## 🎯 Tính năng
 
-- ✅ Nhận dạng mã học sinh (3 chữ số) từ phiếu trắc nghiệm
-- ✅ Đọc đáp án trắc nghiệm (A/B/C/D)
-- ✅ Tự động chấm điểm so với đáp án đúng
-- ✅ API REST đơn giản, dễ tích hợp
-- ✅ Hỗ trợ căn chỉnh ảnh tự động (4 marker góc)
+- ✅ Nhận diện 4 marker góc tự động
+- ✅ Warp ảnh về góc nhìn chuẩn
+- ✅ Đọc mã học sinh (3 cột x 10 số)
+- ✅ Đọc đáp án trắc nghiệm (A,B,C,D)
+- ✅ Chấm điểm tự động
+- ✅ Tích hợp n8n webhook
+- ✅ Production ready
 
-## 🚀 Deploy nhanh
+## 📦 Deploy lên Railway
 
-### 1. Railway.app (Khuyến nghị)
-
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new)
-
-1. Fork repo này về GitHub của bạn
-2. Vào https://railway.app
-3. New Project → Deploy from GitHub repo
-4. Chọn repo vừa fork
-5. Railway tự động deploy!
-
-### 2. Render.com
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
-
-1. Fork repo về GitHub
-2. Vào https://render.com
-3. New → Web Service
-4. Connect repo
-5. Render tự động deploy!
-
-## 🔧 Chạy local
-
-### Cài đặt
+### Cách 1: Deploy từ GitHub
 
 ```bash
-# Clone repo
-git clone https://github.com/YOUR_USERNAME/quickgrader-omr.git
-cd quickgrader-omr
+# 1. Tạo repo mới trên GitHub
+# 2. Push code lên:
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://github.com/YOUR_USERNAME/quickgrader-omr.git
+git push -u origin main
 
-# Tạo virtual environment
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Cài dependencies
-pip install -r requirements.txt
+# 3. Vào Railway.app
+# 4. New Project → Deploy from GitHub
+# 5. Chọn repo → Deploy
 ```
 
-### Chạy server
+### Cách 2: Deploy từ CLI
 
 ```bash
-python omr_service.py
+# Install Railway CLI
+npm i -g @railway/cli
+
+# Login
+railway login
+
+# Deploy
+railway init
+railway up
 ```
 
-Server chạy tại: http://localhost:5000
+## 🔌 API Endpoints
 
-## 📡 API Endpoints
+### GET /health
 
-### Health Check
+Health check
 
-```bash
-GET /health
-```
-
-Response:
+**Response:**
 ```json
 {
-  "status": "OK",
-  "message": "QuickGrader OMR Service is running",
-  "version": "1.0.0"
+  "status": "ok",
+  "service": "QuickGrader OMR v3.0"
 }
 ```
 
-### Process OMR
+### POST /process_omr
 
-```bash
-POST /process_omr
-Content-Type: application/json
+Chấm bài trắc nghiệm
 
+**Request từ QuickGrader App:**
+```json
 {
-  "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg...",
-  "answer_key": ["A", "B", "C", "D", ...],
-  "pass_threshold": 80
+  "lesson_id": "abc123",
+  "teacher_id": 1,
+  "class_id": "toan_8a",
+  "total_questions": 10,
+  "pass_threshold": 80,
+  "answer_key": ["A","B","C","D","A","B","C","D","A","B"],
+  "image_base64": "data:image/jpeg;base64,...",
+  "scanned_at": "2026-01-04T10:30:00.000Z"
 }
 ```
 
-Response:
+**Response:**
 ```json
 {
   "success": true,
   "student_id": "123",
-  "answers": ["A", "B", "C", "D", ...],
-  "score": 18,
-  "percentage": 90,
-  "status": "PASS",
-  "debug": {
-    "total_questions": 20,
-    "answers_detected": 20,
-    "image_size": "1280x720",
-    "markers_found": true
-  }
+  "student_name": "Hoc sinh 123",
+  "answers": ["A","B","C","D","A","B","C","D","A","B"],
+  "score": 10,
+  "percentage": 100,
+  "status": "PASS"
 }
 ```
 
-## 🔗 Tích hợp với n8n
-
-### Workflow `/scan`
-
-**Node 1: Webhook**
-- Method: POST
-- Path: `scan`
-
-**Node 2: HTTP Request**
-- URL: `https://your-omr-service.railway.app/process_omr`
-- Method: POST
-- Body:
+**Error Response:**
 ```json
 {
-  "image": "{{ $json.image_base64 }}",
-  "answer_key": {{ JSON.stringify($json.answer_key) }},
+  "success": false,
+  "error": "Cannot find 4 markers"
+}
+```
+
+## ⚙️ Cấu hình
+
+Điều chỉnh trong `omr_service.py`:
+
+```python
+# Ngưỡng ảnh mờ (càng thấp càng dễ tính)
+BLUR_THRESHOLD = 35.0
+
+# Ngưỡng bubble được tô (càng thấp càng dễ nhận diện)
+FILL_THRESHOLD = 0.08
+
+# Khoảng cách tối thiểu giữa 2 bubble
+MIN_GAP = 0.02
+
+# Vùng ROI (theo phiếu HTML)
+STUDENT_ID_ROI = (0.20, 0.18, 0.80, 0.52)
+ANSWERS_ROI = (0.06, 0.54, 0.94, 0.94)
+```
+
+## 📄 Phiếu trả lời
+
+Sử dụng file `phieu_omr.html`:
+
+1. Mở file HTML trong trình duyệt
+2. **Ctrl + P** → Save as PDF
+3. In trên giấy A4
+
+**Yêu cầu phiếu:**
+- 4 chấm đen tròn ở 4 góc (R ≥ 8mm)
+- Mã học sinh: 3 cột, 10 số (0-9)
+- Đáp án: 10 câu, 4 lựa chọn (A,B,C,D)
+- In 100%, không scale
+
+## 🔗 Tích hợp với n8n
+
+### Workflow:
+
+```
+QuickGrader App
+  → POST /process_omr (Railway)
+  → Response
+  → n8n webhook /scan
+  → MySQL
+  → Zalo notification
+```
+
+### n8n Webhook Config:
+
+**URL:** `https://your-service.up.railway.app/process_omr`
+
+**Method:** POST
+
+**Body:**
+```json
+{
+  "image_base64": "{{ $json.image_base64 }}",
+  "answer_key": {{ $json.answer_key }},
+  "total_questions": {{ $json.total_questions }},
   "pass_threshold": {{ $json.pass_threshold }}
 }
 ```
 
-**Node 3: Respond to Webhook**
-- Body: (để trống - auto return JSON)
+## 🧪 Testing
 
-## 📝 Cấu trúc phiếu trắc nghiệm
+### Test local:
 
-### Yêu cầu:
-1. **4 marker góc** (chấm đen tròn ~8mm) để căn chỉnh
-2. **Phần mã học sinh**: 3 cột, mỗi cột 10 ô (số 0-9)
-3. **Phần đáp án**: Mỗi câu 4 ô (A, B, C, D)
-4. **Ô tròn**: Đường kính 8-12mm, tô đậm bằng bút chì 2B
+```bash
+# Chạy service
+python omr_service.py
 
-### Mẫu phiếu:
-- Tải mẫu: [phieu_trac_nghiem_omr.html](phieu_trac_nghiem_omr.html)
+# Test với curl
+curl -X POST http://localhost:8000/process_omr \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_base64": "data:image/jpeg;base64,...",
+    "answer_key": ["A","B","C","D","A"],
+    "total_questions": 5,
+    "pass_threshold": 80
+  }'
+```
 
-## 🐛 Troubleshooting
+### Test trên Railway:
 
-### Lỗi "No markers found"
-- Kiểm tra 4 góc phiếu có 4 chấm đen rõ ràng không
-- Đảm bảo ảnh chụp đủ sáng, không bị mờ
+```bash
+curl https://your-app.up.railway.app/health
+```
 
-### Lỗi "Student ID not detected"
-- Kiểm tra học sinh đã tô đúng 3 chữ số chưa
-- Tô đậm, đầy ô tròn bằng bút chì đen
+## 📊 Logs
 
-### Lỗi timeout
-- Giảm kích thước ảnh trước khi gửi (max 1280x720)
-- Tăng timeout trong Procfile: `--timeout 600`
+Xem logs trên Railway:
 
-## 📊 Performance
+```bash
+railway logs
+```
 
-- **Thời gian xử lý**: 2-5 giây/phiếu
-- **RAM**: ~100-200MB/request
-- **Throughput**: ~10-20 phiếu/phút (single worker)
+Hoặc vào Railway dashboard → Deployments → View logs
 
-## 🔐 Security
+## 🔧 Troubleshooting
 
-- API không yêu cầu authentication (thêm nếu cần)
-- CORS enabled cho mọi domain
-- Input validation cho image format
-- Rate limiting: Không có (thêm nếu cần)
+### Lỗi: "Cannot find 4 markers"
 
-## 📦 Dependencies
+- Kiểm tra ảnh có đủ sáng
+- 4 chấm đen phải rõ ràng
+- Không bị che khuất
+- Giảm `MARKER_MIN_CIRC` xuống 0.35
 
-- Flask 3.0.0
-- OpenCV 4.8.1.78
-- NumPy 1.24.3
-- imutils 0.5.4
-- Gunicorn 21.2.0
+### Lỗi: "Image too blurry"
 
-## 📄 License
+- Chụp ảnh rõ hơn
+- Không rung tay
+- Giảm `BLUR_THRESHOLD` xuống 30.0
 
-MIT License
+### Đọc sai mã học sinh
 
-## 👨‍💻 Author
+- Tô đậy bubble
+- Chỉ tô 1 bubble/cột
+- Điều chỉnh `STUDENT_ID_ROI`
 
-Trung Tâm Hưng Phương - QuickGrader Team
+### Đọc sai đáp án
 
-## 🤝 Contributing
+- Tô đậy bubble
+- Chỉ tô 1 bubble/câu
+- Giảm `FILL_THRESHOLD` xuống 0.06
 
-Pull requests are welcome!
+## 📞 Support
 
-1. Fork the repo
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Open a Pull Request
+- GitHub Issues: [Link repo]
+- Email: support@quickgrader.com
+
+---
+
+**Version:** 3.0.0  
+**Last updated:** 2026-01-04
